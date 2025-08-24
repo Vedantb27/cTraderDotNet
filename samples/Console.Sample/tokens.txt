@@ -1,0 +1,8 @@
+Access token
+908XKLN1Zwn5jGtXM9QDDWUUPBafDhQy4Y863E7iwgI
+
+Expires in 2628000
+Refresh token
+3cCho86IXDe6PuUq_eQJqgZ-LB_UWI_NFgOsJ5JTshk
+
+Token type: Bearer
