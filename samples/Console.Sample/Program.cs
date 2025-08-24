@@ -19,6 +19,10 @@ namespace ConsoleDemo
         private static readonly string AppSecret = "QUlHf0Cj2qLspmPXoSmzXadcGqOCyI4xGAkyLvgzL7rEpc4fmj";
         private static readonly Mode ServerMode = Mode.Demo; // Change to Mode.Live if needed
         private static readonly List<(OpenClient Client, List<IDisposable> Disposables, CancellationTokenSource Cts)> _cTraderConnections = new();
+        private static readonly object _lock = new object();
+        private static readonly Dictionary<long, OpenClient> _accountToClient = new();
+        private static readonly Dictionary<OpenClient, int> _clientAccountCount = new();
+        private static readonly object _mapLock = new object();
         private static App _app;
         private static Token _token;
 
@@ -26,13 +30,16 @@ namespace ConsoleDemo
         {
             _app = new App(AppId, AppSecret, string.Empty);
 
-            // Start a single cTrader connection (can be scaled to multiple)
-            await StartCTraderConnection();
+            // Start 10 cTrader connections as fire-and-forget async tasks (each running on thread pool threads)
+            for (int i = 0; i < 10; i++)
+            {
+                _ = StartCTraderConnection();
+            }
 
             // Start the HTTP server in the main thread
             await StartHttpServer();
 
-            // Keep the application running
+            // Keep the application running (though StartHttpServer() loops infinitely)
             Console.WriteLine("Application running. Press Ctrl+C to exit.");
             await Task.Delay(Timeout.Infinite); // Non-blocking wait
         }
@@ -53,8 +60,16 @@ namespace ConsoleDemo
                 disposables.Add(client.Where(iMessage => iMessage is not ProtoHeartbeatEvent).Subscribe(OnMessageReceived, OnException));
                 disposables.Add(client.OfType<ProtoOARefreshTokenRes>().Subscribe(OnRefreshTokenResponse));
 
-                // Add to connection list for management
-                _cTraderConnections.Add((client, disposables, cts));
+                // Add to connection list for management (thread-safe)
+                lock (_lock)
+                {
+                    _cTraderConnections.Add((client, disposables, cts));
+                }
+
+                lock (_mapLock)
+                {
+                    _clientAccountCount[client] = 0;
+                }
 
                 Console.WriteLine("Connecting cTrader Client...");
                 await client.Connect();
@@ -87,7 +102,19 @@ namespace ConsoleDemo
             disposables.ForEach(d => d.Dispose());
             client?.Dispose();
             cts?.Dispose();
-            _cTraderConnections.RemoveAll(c => c.Client == client);
+            lock (_lock)
+            {
+                _cTraderConnections.RemoveAll(c => c.Client == client);
+            }
+            lock (_mapLock)
+            {
+                var accountsToRemove = _accountToClient.Where(kv => kv.Value == client).Select(kv => kv.Key).ToList();
+                foreach (var accountId in accountsToRemove)
+                {
+                    _accountToClient.Remove(accountId);
+                }
+                _clientAccountCount.Remove(client);
+            }
             Console.WriteLine("cTrader connection cleaned up.");
         }
 
@@ -119,10 +146,13 @@ namespace ConsoleDemo
 
         private static async void RefreshToken()
         {
-            if (_cTraderConnections.Count == 0)
+            lock (_lock)
             {
-                Console.WriteLine("No active cTrader connections.");
-                return;
+                if (_cTraderConnections.Count == 0)
+                {
+                    Console.WriteLine("No active cTrader connections.");
+                    return;
+                }
             }
 
             if (string.IsNullOrWhiteSpace(_token?.RefreshToken))
@@ -137,84 +167,132 @@ namespace ConsoleDemo
                 RefreshToken = _token.RefreshToken
             };
 
-            foreach (var (client, _, _) in _cTraderConnections)
+            lock (_lock)
             {
-                await client.SendMessage(request);
+                foreach (var (client, _, _) in _cTraderConnections)
+                {
+                    _ = client.SendMessage(request); // Fire-and-forget to avoid blocking
+                }
             }
         }
 
         private static async void SubscribeToSymbolTrendBar(string[] commandSplit)
         {
-            if (_cTraderConnections.Count == 0) return;
+            lock (_lock)
+            {
+                if (_cTraderConnections.Count == 0) return;
+            }
+
+            var accountId = long.Parse(commandSplit[3]);
+            OpenClient client;
+            lock (_mapLock)
+            {
+                if (!_accountToClient.TryGetValue(accountId, out client))
+                {
+                    Console.WriteLine($"Account {accountId} not authenticated on any connection.");
+                    return;
+                }
+            }
 
             Console.WriteLine("Sending ProtoOASubscribeLiveTrendbarReq...");
             var request = new ProtoOASubscribeLiveTrendbarReq
             {
                 Period = (ProtoOATrendbarPeriod)Enum.Parse(typeof(ProtoOATrendbarPeriod), commandSplit[2], true),
-                CtidTraderAccountId = long.Parse(commandSplit[3]),
+                CtidTraderAccountId = accountId,
                 SymbolId = long.Parse(commandSplit[4]),
             };
 
-            foreach (var (client, _, _) in _cTraderConnections)
-            {
-                await client.SendMessage(request);
-            }
+            await client.SendMessage(request);
         }
 
         private static async void SubscribeToSymbolSpot(string[] commandSplit)
         {
-            if (_cTraderConnections.Count == 0) return;
+            lock (_lock)
+            {
+                if (_cTraderConnections.Count == 0) return;
+            }
+
+            var accountId = long.Parse(commandSplit[2]);
+            OpenClient client;
+            lock (_mapLock)
+            {
+                if (!_accountToClient.TryGetValue(accountId, out client))
+                {
+                    Console.WriteLine($"Account {accountId} not authenticated on any connection.");
+                    return;
+                }
+            }
 
             Console.WriteLine("Sending ProtoOASubscribeSpotsReq...");
             var request = new ProtoOASubscribeSpotsReq
             {
-                CtidTraderAccountId = long.Parse(commandSplit[2]),
+                CtidTraderAccountId = accountId,
             };
             request.SymbolId.AddRange(commandSplit.Skip(3).Select(iSymbolId => long.Parse(iSymbolId)));
 
-            foreach (var (client, _, _) in _cTraderConnections)
-            {
-                await client.SendMessage(request);
-            }
+            await client.SendMessage(request);
         }
 
         private static async void SymbolListRequest(string[] commandSplit)
         {
-            if (_cTraderConnections.Count == 0) return;
+            lock (_lock)
+            {
+                if (_cTraderConnections.Count == 0) return;
+            }
 
             var accountId = long.Parse(commandSplit[1]);
+            OpenClient client;
+            lock (_mapLock)
+            {
+                if (!_accountToClient.TryGetValue(accountId, out client))
+                {
+                    Console.WriteLine($"Account {accountId} not authenticated on any connection.");
+                    return;
+                }
+            }
+
             Console.WriteLine("Sending ProtoOASymbolsListReq...");
             var request = new ProtoOASymbolsListReq
             {
                 CtidTraderAccountId = accountId,
             };
 
-            foreach (var (client, _, _) in _cTraderConnections)
-            {
-                await client.SendMessage(request);
-            }
+            await client.SendMessage(request);
         }
 
         private static async void ReconcileRequest(string[] commandSplit)
         {
-            if (_cTraderConnections.Count == 0) return;
+            lock (_lock)
+            {
+                if (_cTraderConnections.Count == 0) return;
+            }
 
             var accountId = long.Parse(commandSplit[1]);
+            OpenClient client;
+            lock (_mapLock)
+            {
+                if (!_accountToClient.TryGetValue(accountId, out client))
+                {
+                    Console.WriteLine($"Account {accountId} not authenticated on any connection.");
+                    return;
+                }
+            }
+
             Console.WriteLine("Sending ProtoOAReconcileReq...");
             var request = new ProtoOAReconcileReq
             {
                 CtidTraderAccountId = accountId,
             };
 
-            foreach (var (client, _, _) in _cTraderConnections)
-            {
-                await client.SendMessage(request);
-            }
+            await client.SendMessage(request);
         }
 
         private static async void AccountListRequest()
         {
-            if (_cTraderConnections.Count == 0) return;
+            lock (_lock)
+            {
+                if (_cTraderConnections.Count == 0) return;
+            }
 
             Console.WriteLine("Sending ProtoOAGetAccountListByAccessTokenReq...");
             var request = new ProtoOAGetAccountListByAccessTokenReq
@@ -222,17 +300,44 @@ namespace ConsoleDemo
                 AccessToken = _token.AccessToken,
             };
 
-            foreach (var (client, _, _) in _cTraderConnections)
+            // Since account list is token-based, not account-specific, send to first connection
+            OpenClient client;
+            lock (_lock)
             {
-                await client.SendMessage(request);
+                client = _cTraderConnections.FirstOrDefault().Client;
+                if (client == null) return;
             }
+
+            await client.SendMessage(request);
         }
 
         private static async void AccountAuthRequest(string[] commandSplit)
         {
-            if (_cTraderConnections.Count == 0) return;
+            lock (_lock)
+            {
+                if (_cTraderConnections.Count == 0) return;
+            }
 
             var accountId = long.Parse(commandSplit[1]);
+
+            OpenClient selectedClient;
+            lock (_mapLock)
+            {
+                if (_accountToClient.TryGetValue(accountId, out var existingClient))
+                {
+                    selectedClient = existingClient;
+                }
+                else
+                {
+                    selectedClient = SelectLeastLoadedClient();
+                    if (selectedClient == null)
+                    {
+                        Console.WriteLine("No available connections.");
+                        return;
+                    }
+                }
+            }
+
             Console.WriteLine("Sending ProtoOAAccountAuthReq...");
             var request = new ProtoOAAccountAuthReq
             {
@@ -240,17 +345,70 @@ namespace ConsoleDemo
                 AccessToken = _token.AccessToken
             };
 
-            foreach (var (client, _, _) in _cTraderConnections)
-            {
-                await client.SendMessage(request);
-            }
+            // Subscribe for response
+            var tcs = new TaskCompletionSource<bool>();
+            var subscription = selectedClient.Where(msg => msg is ProtoOAAccountAuthRes || msg is ProtoOAErrorRes)
+                .Subscribe(
+                    msg =>
+                    {
+                        if (msg is ProtoOAAccountAuthRes)
+                        {
+                            lock (_mapLock)
+                            {
+                                if (!_accountToClient.ContainsKey(accountId))
+                                {
+                                    _accountToClient[accountId] = selectedClient;
+                                    _clientAccountCount[selectedClient] = _clientAccountCount.GetValueOrDefault(selectedClient, 0) + 1;
+                                }
+                            }
+                            tcs.TrySetResult(true);
+                        }
+                        else if (msg is ProtoOAErrorRes errorRes)
+                        {
+                            if (errorRes.ErrorCode == "ALREADY_LOGGED_IN")
+                            {
+                                lock (_mapLock)
+                                {
+                                    if (!_accountToClient.ContainsKey(accountId))
+                                    {
+                                        _accountToClient[accountId] = selectedClient;
+                                        _clientAccountCount[selectedClient] = _clientAccountCount.GetValueOrDefault(selectedClient, 0) + 1;
+                                    }
+                                }
+                                tcs.TrySetResult(true);
+                            }
+                            else
+                            {
+                                tcs.TrySetResult(false);
+                            }
+                        }
+                    },
+                    ex => tcs.TrySetException(ex));
+
+            await selectedClient.SendMessage(request);
+
+            await tcs.Task;
+            subscription.Dispose();
         }
 
         private static async void TickDataRequest(string[] commandSplit)
         {
-            if (_cTraderConnections.Count == 0) return;
+            lock (_lock)
+            {
+                if (_cTraderConnections.Count == 0) return;
+            }
 
             var accountId = long.Parse(commandSplit[1]);
+            OpenClient client;
+            lock (_mapLock)
+            {
+                if (!_accountToClient.TryGetValue(accountId, out client))
+                {
+                    Console.WriteLine($"Account {accountId} not authenticated on any connection.");
+                    return;
+                }
+            }
+
             var symbolId = long.Parse(commandSplit[2]);
             var type = commandSplit[3].ToLowerInvariant() switch
             {
@@ -268,18 +426,28 @@ namespace ConsoleDemo
                 Type = type
             };
 
-            foreach (var (client, _, _) in _cTraderConnections)
-            {
-                await client.SendMessage(request);
-            }
+            await client.SendMessage(request);
         }
 
         private static async void TrendbarRequest(string[] commandSplit)
         {
-            if (_cTraderConnections.Count == 0) return;
+            lock (_lock)
+            {
+                if (_cTraderConnections.Count == 0) return;
+            }
+
+            var accountId = long.Parse(commandSplit[2]);
+            OpenClient client;
+            lock (_mapLock)
+            {
+                if (!_accountToClient.TryGetValue(accountId, out client))
+                {
+                    Console.WriteLine($"Account {accountId} not authenticated on any connection.");
+                    return;
+                }
+            }
 
             var period = (ProtoOATrendbarPeriod)Enum.Parse(typeof(ProtoOATrendbarPeriod), commandSplit[1], true);
-            var accountId = long.Parse(commandSplit[2]);
             var symbolId = long.Parse(commandSplit[3]);
             var days = long.Parse(commandSplit[4]);
             Console.WriteLine("Sending ProtoOAGetTrendbarsReq...");
@@ -293,15 +461,15 @@ namespace ConsoleDemo
             };
             Console.WriteLine($"FromTimestamp: {request.FromTimestamp} | ToTimestamp: {request.ToTimestamp}");
 
-            foreach (var (client, _, _) in _cTraderConnections)
-            {
-                await client.SendMessage(request);
-            }
+            await client.SendMessage(request);
         }
 
         private static async void ProfileRequest()
         {
-            if (_cTraderConnections.Count == 0) return;
+            lock (_lock)
+            {
+                if (_cTraderConnections.Count == 0) return;
+            }
 
             Console.WriteLine("Sending ProtoOAGetCtidProfileByTokenReq...");
             var request = new ProtoOAGetCtidProfileByTokenReq
@@ -309,10 +477,15 @@ namespace ConsoleDemo
                 AccessToken = _token.AccessToken
             };
 
-            foreach (var (client, _, _) in _cTraderConnections)
+            // Send to first connection
+            OpenClient client;
+            lock (_lock)
             {
-                await client.SendMessage(request);
+                client = _cTraderConnections.FirstOrDefault().Client;
+                if (client == null) return;
             }
+
+            await client.SendMessage(request);
         }
 
         private static void ShowDashLine() => Console.WriteLine("--------------------------------------------------");
@@ -320,7 +493,12 @@ namespace ConsoleDemo
         private static void Disconnect()
         {
             Console.WriteLine("Disconnecting all cTrader connections...");
-            foreach (var (client, disposables, cts) in _cTraderConnections)
+            List<(OpenClient, List<IDisposable>, CancellationTokenSource)> connectionsCopy;
+            lock (_lock)
+            {
+                connectionsCopy = new List<(OpenClient, List<IDisposable>, CancellationTokenSource)>(_cTraderConnections);
+            }
+            foreach (var (client, disposables, cts) in connectionsCopy)
             {
                 CleanupConnection(client, disposables, cts);
             }
@@ -353,6 +531,30 @@ namespace ConsoleDemo
                 {
                     throw;
                 }
+            }
+        }
+
+        private static OpenClient SelectLeastLoadedClient()
+        {
+            lock (_lock)
+            {
+                if (_cTraderConnections.Count == 0) return null;
+            }
+
+            lock (_mapLock)
+            {
+                OpenClient leastLoaded = null;
+                int minCount = int.MaxValue;
+                foreach (var client in _cTraderConnections.Select(c => c.Client))
+                {
+                    int count = _clientAccountCount.GetValueOrDefault(client, 0);
+                    if (count < minCount)
+                    {
+                        minCount = count;
+                        leastLoaded = client;
+                    }
+                }
+                return leastLoaded;
             }
         }
 
@@ -393,6 +595,8 @@ namespace ConsoleDemo
                     return;
                 }
                 // Handle POST request to /account-auth
+
+                // Handle POST request to /account-auth
                 else if (request.HttpMethod == "POST" && request.Url.AbsolutePath == "/account-auth")
                 {
                     using var reader = new System.IO.StreamReader(request.InputStream, request.ContentEncoding);
@@ -429,51 +633,88 @@ namespace ConsoleDemo
 
                     Console.WriteLine($"Received HTTP POST request to authenticate account: {accountId}");
 
-                    var tcs = new TaskCompletionSource<string>();
+                    OpenClient selectedClient;
+                    bool noConnectionsAvailable = false;
+                    lock (_mapLock)
+                    {
+                        if (_accountToClient.TryGetValue(accountId, out var existingClient))
+                        {
+                            selectedClient = existingClient;
+                        }
+                        else
+                        {
+                            selectedClient = SelectLeastLoadedClient();
+                            if (selectedClient == null)
+                            {
+                                noConnectionsAvailable = true;
+                            }
+                        }
+                    }
 
+                    if (noConnectionsAvailable)
+                    {
+                        response.StatusCode = 503;
+                        await WriteResponse(response, "No available connections.");
+                        return;
+                    }
+
+                    var tcs = new TaskCompletionSource<string>();
                     List<IDisposable> subscriptions = new List<IDisposable>();
 
-                    foreach (var (client, _, _) in _cTraderConnections)
+                    var subscription = selectedClient.Where(msg => msg is ProtoOAAccountAuthRes || msg is ProtoOAErrorRes)
+                        .Subscribe(
+                            msg =>
+                            {
+                                if (msg is ProtoOAAccountAuthRes authRes)
+                                {
+                                    lock (_mapLock)
+                                    {
+                                        if (!_accountToClient.ContainsKey(accountId))
+                                        {
+                                            _accountToClient[accountId] = selectedClient;
+                                            _clientAccountCount[selectedClient] = _clientAccountCount.GetValueOrDefault(selectedClient, 0) + 1;
+                                        }
+                                    }
+                                    var responseMessage = $"AccountAuth Response for accountId {accountId}: Success";
+                                    tcs.TrySetResult(responseMessage);
+                                }
+                                else if (msg is ProtoOAErrorRes errorRes)
+                                {
+                                    if (errorRes.ErrorCode == "ALREADY_LOGGED_IN")
+                                    {
+                                        lock (_mapLock)
+                                        {
+                                            if (!_accountToClient.ContainsKey(accountId))
+                                            {
+                                                _accountToClient[accountId] = selectedClient;
+                                                _clientAccountCount[selectedClient] = _clientAccountCount.GetValueOrDefault(selectedClient, 0) + 1;
+                                            }
+                                        }
+                                        tcs.TrySetResult($"Account {accountId} is already authenticated");
+                                    }
+                                    else
+                                    {
+                                        tcs.TrySetResult($"Error authenticating account {accountId}: {errorRes.ErrorCode} - {errorRes.Description}");
+                                    }
+                                }
+                            },
+                            ex =>
+                            {
+                                tcs.TrySetException(ex);
+                            },
+                            () =>
+                            {
+                                // Subscription completed (optional cleanup)
+                            });
+
+                    subscriptions.Add(subscription);
+
+                    var authReq = new ProtoOAAccountAuthReq
                     {
-                        var subscription = client.Where(msg => msg is ProtoOAAccountAuthRes || msg is ProtoOAErrorRes)
-                            .Subscribe(
-                                msg =>
-                                {
-                                    if (msg is ProtoOAAccountAuthRes authRes)
-                                    {
-                                        var responseMessage = $"AccountAuth Response for accountId {accountId}: Success";
-                                        tcs.TrySetResult(responseMessage);
-                                    }
-                                    else if (msg is ProtoOAErrorRes errorRes)
-                                    {
-                                        if (errorRes.ErrorCode == "ALREADY_LOGGED_IN")
-                                        {
-                                            tcs.TrySetResult($"Account {accountId} is already authenticated");
-                                        }
-                                        else
-                                        {
-                                            tcs.TrySetResult($"Error authenticating account {accountId}: {errorRes.ErrorCode} - {errorRes.Description}");
-                                        }
-                                    }
-                                },
-                                ex =>
-                                {
-                                    tcs.TrySetException(ex);
-                                },
-                                () =>
-                                {
-                                    // Subscription completed (optional cleanup)
-                                });
-
-                        subscriptions.Add(subscription);
-
-                        var authReq = new ProtoOAAccountAuthReq
-                        {
-                            CtidTraderAccountId = accountId,
-                            AccessToken = accessToken
-                        };
-                        await client.SendMessage(authReq);
-                    }
+                        CtidTraderAccountId = accountId,
+                        AccessToken = accessToken
+                    };
+                    await selectedClient.SendMessage(authReq);
 
                     var timeoutTask = Task.Delay(TimeSpan.FromSeconds(10));
                     var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
@@ -498,6 +739,8 @@ namespace ConsoleDemo
                     await WriteResponse(response, tcs.Task.Result);
                     subscriptions.ForEach(s => s.Dispose());
                 }
+
+                // Handle POST request to /deal-list
                 // Handle POST request to /deal-list
                 else if (request.HttpMethod == "POST" && request.Url.AbsolutePath == "/deal-list")
                 {
@@ -542,83 +785,98 @@ namespace ConsoleDemo
 
                     Console.WriteLine($"Received HTTP POST request for deal list: ctidTraderAccountId={ctidTraderAccountId}, fromTimestamp={fromTimestamp}, toTimestamp={toTimestamp}");
 
+                    OpenClient client;
+                    bool accountNotAuthenticated = false;
+                    lock (_mapLock)
+                    {
+                        if (!_accountToClient.TryGetValue(ctidTraderAccountId, out client))
+                        {
+                            accountNotAuthenticated = true;
+                        }
+                    }
+
+                    if (accountNotAuthenticated)
+                    {
+                        response.StatusCode = 400;
+                        await WriteResponse(response, $"Account {ctidTraderAccountId} not authenticated.");
+                        return;
+                    }
+
                     var tcs = new TaskCompletionSource<string>();
 
                     IDisposable successSubscription = null;
                     IDisposable errorSubscription = null;
-                    foreach (var (client, _, _) in _cTraderConnections)
-                    {
-                        successSubscription = client.OfType<ProtoOADealListRes>()
-                            .Where(res => res.CtidTraderAccountId == ctidTraderAccountId)
-                            .Take(1)
-                            .Subscribe(
-                                dealRes =>
+
+                    successSubscription = client.OfType<ProtoOADealListRes>()
+                        .Where(res => res.CtidTraderAccountId == ctidTraderAccountId)
+                        .Take(1)
+                        .Subscribe(
+                            dealRes =>
+                            {
+                                var responseMessage = JsonSerializer.Serialize(new
                                 {
-                                    var responseMessage = JsonSerializer.Serialize(new
+                                    ctidTraderAccountId = dealRes.CtidTraderAccountId,
+                                    deals = dealRes.Deal.Select(deal => new
                                     {
-                                        ctidTraderAccountId = dealRes.CtidTraderAccountId,
-                                        deals = dealRes.Deal.Select(deal => new
+                                        dealId = deal.DealId,
+                                        orderId = deal.OrderId,
+                                        positionId = deal.PositionId,
+                                        volume = deal.Volume,
+                                        filledVolume = deal.FilledVolume,
+                                        symbolId = deal.SymbolId,
+                                        createTimestamp = deal.CreateTimestamp,
+                                        executionTimestamp = deal.ExecutionTimestamp,
+                                        utcLastUpdateTimestamp = deal.UtcLastUpdateTimestamp,
+                                        executionPrice = deal.ExecutionPrice,
+                                        tradeSide = deal.TradeSide.ToString(),
+                                        dealStatus = deal.DealStatus.ToString(),
+                                        marginRate = deal.MarginRate,
+                                        commission = deal.Commission,
+                                        baseToUsdConversionRate = deal.BaseToUsdConversionRate,
+                                        closePositionDetail = deal.ClosePositionDetail != null ? new
                                         {
-                                            dealId = deal.DealId,
-                                            orderId = deal.OrderId,
-                                            positionId = deal.PositionId,
-                                            volume = deal.Volume,
-                                            filledVolume = deal.FilledVolume,
-                                            symbolId = deal.SymbolId,
-                                            createTimestamp = deal.CreateTimestamp,
-                                            executionTimestamp = deal.ExecutionTimestamp,
-                                            utcLastUpdateTimestamp = deal.UtcLastUpdateTimestamp,
-                                            executionPrice = deal.ExecutionPrice,
-                                            tradeSide = deal.TradeSide.ToString(),
-                                            dealStatus = deal.DealStatus.ToString(),
-                                            marginRate = deal.MarginRate,
-                                            commission = deal.Commission,
-                                            baseToUsdConversionRate = deal.BaseToUsdConversionRate,
-                                            closePositionDetail = deal.ClosePositionDetail != null ? new
-                                            {
-                                                entryPrice = deal.ClosePositionDetail.EntryPrice,
-                                                grossProfit = deal.ClosePositionDetail.GrossProfit,
-                                                swap = deal.ClosePositionDetail.Swap,
-                                                commission = deal.ClosePositionDetail.Commission,
-                                                balance = deal.ClosePositionDetail.Balance,
-                                                quoteToDepositConversionRate = deal.ClosePositionDetail.QuoteToDepositConversionRate,
-                                                closedVolume = deal.ClosePositionDetail.ClosedVolume,
-                                                balanceVersion = deal.ClosePositionDetail.BalanceVersion,
-                                                moneyDigits = deal.ClosePositionDetail.MoneyDigits,
-                                                pnlConversionFee = deal.ClosePositionDetail.PnlConversionFee
-                                            } : null,
-                                            moneyDigits = deal.MoneyDigits
-                                        }).ToList(),
-                                        hasMore = dealRes.HasMore
-                                    }, new JsonSerializerOptions { WriteIndented = true });
-                                    tcs.TrySetResult(responseMessage);
-                                    successSubscription?.Dispose();
-                                });
+                                            entryPrice = deal.ClosePositionDetail.EntryPrice,
+                                            grossProfit = deal.ClosePositionDetail.GrossProfit,
+                                            swap = deal.ClosePositionDetail.Swap,
+                                            commission = deal.ClosePositionDetail.Commission,
+                                            balance = deal.ClosePositionDetail.Balance,
+                                            quoteToDepositConversionRate = deal.ClosePositionDetail.QuoteToDepositConversionRate,
+                                            closedVolume = deal.ClosePositionDetail.ClosedVolume,
+                                            balanceVersion = deal.ClosePositionDetail.BalanceVersion,
+                                            moneyDigits = deal.ClosePositionDetail.MoneyDigits,
+                                            pnlConversionFee = deal.ClosePositionDetail.PnlConversionFee
+                                        } : null,
+                                        moneyDigits = deal.MoneyDigits
+                                    }).ToList(),
+                                    hasMore = dealRes.HasMore
+                                }, new JsonSerializerOptions { WriteIndented = true });
+                                tcs.TrySetResult(responseMessage);
+                                successSubscription?.Dispose();
+                            });
 
-                        errorSubscription = client.OfType<ProtoOAErrorRes>()
-                            .Where(err => err.CtidTraderAccountId == ctidTraderAccountId)
-                            .Take(1)
-                            .Subscribe(
-                                errRes =>
+                    errorSubscription = client.OfType<ProtoOAErrorRes>()
+                        .Where(err => err.CtidTraderAccountId == ctidTraderAccountId)
+                        .Take(1)
+                        .Subscribe(
+                            errRes =>
+                            {
+                                var errorMessage = JsonSerializer.Serialize(new
                                 {
-                                    var errorMessage = JsonSerializer.Serialize(new
-                                    {
-                                        ctidTraderAccountId = errRes.CtidTraderAccountId,
-                                        errorCode = errRes.ErrorCode.ToString(),
-                                        description = errRes.Description
-                                    }, new JsonSerializerOptions { WriteIndented = true });
-                                    tcs.TrySetResult(errorMessage);
-                                    errorSubscription?.Dispose();
-                                });
+                                    ctidTraderAccountId = errRes.CtidTraderAccountId,
+                                    errorCode = errRes.ErrorCode.ToString(),
+                                    description = errRes.Description
+                                }, new JsonSerializerOptions { WriteIndented = true });
+                                tcs.TrySetResult(errorMessage);
+                                errorSubscription?.Dispose();
+                            });
 
-                        var dealReq = new ProtoOADealListReq
-                        {
-                            CtidTraderAccountId = ctidTraderAccountId,
-                            FromTimestamp = fromTimestamp,
-                            ToTimestamp = toTimestamp
-                        };
-                        await client.SendMessage(dealReq);
-                    }
+                    var dealReq = new ProtoOADealListReq
+                    {
+                        CtidTraderAccountId = ctidTraderAccountId,
+                        FromTimestamp = fromTimestamp,
+                        ToTimestamp = toTimestamp
+                    };
+                    await client.SendMessage(dealReq);
 
                     var timeoutTask = Task.Delay(TimeSpan.FromSeconds(10));
                     var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
@@ -636,6 +894,7 @@ namespace ConsoleDemo
                     response.StatusCode = 200;
                     await WriteResponse(response, tcs.Task.Result);
                 }
+                // Handle POST request to /order-list
                 // Handle POST request to /order-list
                 else if (request.HttpMethod == "POST" && request.Url.AbsolutePath == "/order-list")
                 {
@@ -699,75 +958,90 @@ namespace ConsoleDemo
 
                     Console.WriteLine($"Received HTTP POST request for order list: ctidTraderAccountId={ctidTraderAccountId}, includeClosed={includeClosed}, fromTimestamp={fromTimestamp}, toTimestamp={toTimestamp}");
 
+                    OpenClient client;
+                    bool accountNotAuthenticated = false;
+                    lock (_mapLock)
+                    {
+                        if (!_accountToClient.TryGetValue(ctidTraderAccountId, out client))
+                        {
+                            accountNotAuthenticated = true;
+                        }
+                    }
+
+                    if (accountNotAuthenticated)
+                    {
+                        response.StatusCode = 400;
+                        await WriteResponse(response, $"Account {ctidTraderAccountId} not authenticated.");
+                        return;
+                    }
+
                     var tcs = new TaskCompletionSource<string>();
 
                     IDisposable successSubscription = null;
                     IDisposable errorSubscription = null;
-                    foreach (var (client, _, _) in _cTraderConnections)
-                    {
-                        successSubscription = client.OfType<ProtoOAOrderListRes>()
-                            .Where(res => res.CtidTraderAccountId == ctidTraderAccountId)
-                            .Take(1)
-                            .Subscribe(
-                                orderRes =>
+
+                    successSubscription = client.OfType<ProtoOAOrderListRes>()
+                        .Where(res => res.CtidTraderAccountId == ctidTraderAccountId)
+                        .Take(1)
+                        .Subscribe(
+                            orderRes =>
+                            {
+                                var responseMessage = JsonSerializer.Serialize(new
                                 {
-                                    var responseMessage = JsonSerializer.Serialize(new
+                                    ctidTraderAccountId = orderRes.CtidTraderAccountId,
+                                    orders = orderRes.Order.Select(order => new
                                     {
-                                        ctidTraderAccountId = orderRes.CtidTraderAccountId,
-                                        orders = orderRes.Order.Select(order => new
+                                        orderId = order.OrderId,
+                                        tradeData = new
                                         {
-                                            orderId = order.OrderId,
-                                            tradeData = new
-                                            {
-                                                symbolId = order.TradeData?.SymbolId,
-                                                volume = order.TradeData?.Volume,
-                                                tradeSide = order.TradeData?.TradeSide.ToString(),
-                                                openTimestamp = order.TradeData?.OpenTimestamp,
-                                                guaranteedStopLoss = order.TradeData?.GuaranteedStopLoss
-                                            },
-                                            orderType = order.OrderType.ToString(),
-                                            orderStatus = order.OrderStatus.ToString(),
-                                            executionPrice = order.ExecutionPrice,
-                                            executedVolume = order.ExecutedVolume,
-                                            utcLastUpdateTimestamp = order.UtcLastUpdateTimestamp,
-                                            closingOrder = order.ClosingOrder,
-                                            clientOrderId = order.ClientOrderId,
-                                            timeInForce = order.TimeInForce.ToString(),
-                                            positionId = order.PositionId
-                                        }).ToList(),
-                                        hasMore = orderRes.HasMore
-                                    }, new JsonSerializerOptions { WriteIndented = true });
-                                    tcs.TrySetResult(responseMessage);
-                                    successSubscription?.Dispose();
-                                });
+                                            symbolId = order.TradeData?.SymbolId,
+                                            volume = order.TradeData?.Volume,
+                                            tradeSide = order.TradeData?.TradeSide.ToString(),
+                                            openTimestamp = order.TradeData?.OpenTimestamp,
+                                            guaranteedStopLoss = order.TradeData?.GuaranteedStopLoss
+                                        },
+                                        orderType = order.OrderType.ToString(),
+                                        orderStatus = order.OrderStatus.ToString(),
+                                        executionPrice = order.ExecutionPrice,
+                                        executedVolume = order.ExecutedVolume,
+                                        utcLastUpdateTimestamp = order.UtcLastUpdateTimestamp,
+                                        closingOrder = order.ClosingOrder,
+                                        clientOrderId = order.ClientOrderId,
+                                        timeInForce = order.TimeInForce.ToString(),
+                                        positionId = order.PositionId
+                                    }).ToList(),
+                                    hasMore = orderRes.HasMore
+                                }, new JsonSerializerOptions { WriteIndented = true });
+                                tcs.TrySetResult(responseMessage);
+                                successSubscription?.Dispose();
+                            });
 
-                        errorSubscription = client.OfType<ProtoOAErrorRes>()
-                            .Where(err => err.CtidTraderAccountId == ctidTraderAccountId)
-                            .Take(1)
-                            .Subscribe(
-                                errRes =>
+                    errorSubscription = client.OfType<ProtoOAErrorRes>()
+                        .Where(err => err.CtidTraderAccountId == ctidTraderAccountId)
+                        .Take(1)
+                        .Subscribe(
+                            errRes =>
+                            {
+                                var errorMessage = JsonSerializer.Serialize(new
                                 {
-                                    var errorMessage = JsonSerializer.Serialize(new
-                                    {
-                                        ctidTraderAccountId = errRes.CtidTraderAccountId,
-                                        errorCode = errRes.ErrorCode.ToString(),
-                                        description = errRes.Description
-                                    }, new JsonSerializerOptions { WriteIndented = true });
-                                    tcs.TrySetResult(errorMessage);
-                                    errorSubscription?.Dispose();
-                                });
+                                    ctidTraderAccountId = errRes.CtidTraderAccountId,
+                                    errorCode = errRes.ErrorCode.ToString(),
+                                    description = errRes.Description
+                                }, new JsonSerializerOptions { WriteIndented = true });
+                                tcs.TrySetResult(errorMessage);
+                                errorSubscription?.Dispose();
+                            });
 
-                        var orderReq = new ProtoOAOrderListReq
-                        {
-                            CtidTraderAccountId = ctidTraderAccountId,
-                        };
-                        if (fromTimestamp.HasValue)
-                            orderReq.FromTimestamp = fromTimestamp.Value;
-                        if (toTimestamp.HasValue)
-                            orderReq.ToTimestamp = toTimestamp.Value;
+                    var orderReq = new ProtoOAOrderListReq
+                    {
+                        CtidTraderAccountId = ctidTraderAccountId,
+                    };
+                    if (fromTimestamp.HasValue)
+                        orderReq.FromTimestamp = fromTimestamp.Value;
+                    if (toTimestamp.HasValue)
+                        orderReq.ToTimestamp = toTimestamp.Value;
 
-                        await client.SendMessage(orderReq);
-                    }
+                    await client.SendMessage(orderReq);
 
                     var timeoutTask = Task.Delay(TimeSpan.FromSeconds(10));
                     var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
@@ -785,6 +1059,7 @@ namespace ConsoleDemo
                     response.StatusCode = 200;
                     await WriteResponse(response, tcs.Task.Result);
                 }
+                // Handle POST request to /symbol-list
                 // Handle POST request to /symbol-list
                 else if (request.HttpMethod == "POST" && request.Url.AbsolutePath == "/symbol-list")
                 {
@@ -824,58 +1099,73 @@ namespace ConsoleDemo
 
                     Console.WriteLine($"Received HTTP POST request for symbol list: ctidTraderAccountId={ctidTraderAccountId}, includeArchived={includeArchived}");
 
+                    OpenClient client;
+                    bool accountNotAuthenticated = false;
+                    lock (_mapLock)
+                    {
+                        if (!_accountToClient.TryGetValue(ctidTraderAccountId, out client))
+                        {
+                            accountNotAuthenticated = true;
+                        }
+                    }
+
+                    if (accountNotAuthenticated)
+                    {
+                        response.StatusCode = 400;
+                        await WriteResponse(response, $"Account {ctidTraderAccountId} not authenticated.");
+                        return;
+                    }
+
                     var tcs = new TaskCompletionSource<string>();
 
                     IDisposable successSubscription = null;
                     IDisposable errorSubscription = null;
-                    foreach (var (client, _, _) in _cTraderConnections)
+
+                    successSubscription = client.OfType<ProtoOASymbolsListRes>()
+                        .Where(res => res.CtidTraderAccountId == ctidTraderAccountId)
+                        .Take(1)
+                        .Subscribe(
+                            symbolRes =>
+                            {
+                                var responseMessage = JsonSerializer.Serialize(new
+                                {
+                                    ctidTraderAccountId = symbolRes.CtidTraderAccountId,
+                                    symbols = symbolRes.Symbol.Select(symbol => new
+                                    {
+                                        symbolId = symbol.SymbolId,
+                                        symbolName = symbol.SymbolName,
+                                        enabled = symbol.Enabled,
+                                        baseAssetId = symbol.BaseAssetId,
+                                        quoteAssetId = symbol.QuoteAssetId,
+                                        symbolCategoryId = symbol.SymbolCategoryId,
+                                        description = symbol.Description
+                                    }).ToList()
+                                }, new JsonSerializerOptions { WriteIndented = true });
+                                tcs.TrySetResult(responseMessage);
+                                successSubscription?.Dispose();
+                            });
+
+                    errorSubscription = client.OfType<ProtoOAErrorRes>()
+                        .Where(err => err.CtidTraderAccountId == ctidTraderAccountId)
+                        .Take(1)
+                        .Subscribe(
+                            errRes =>
+                            {
+                                var errorMessage = JsonSerializer.Serialize(new
+                                {
+                                    ctidTraderAccountId = errRes.CtidTraderAccountId,
+                                    errorCode = errRes.ErrorCode.ToString(),
+                                    description = errRes.Description
+                                }, new JsonSerializerOptions { WriteIndented = true });
+                                tcs.TrySetResult(errorMessage);
+                                errorSubscription?.Dispose();
+                            });
+
+                    var symbolReq = new ProtoOASymbolsListReq
                     {
-                        successSubscription = client.OfType<ProtoOASymbolsListRes>()
-                            .Where(res => res.CtidTraderAccountId == ctidTraderAccountId)
-                            .Take(1)
-                            .Subscribe(
-                                symbolRes =>
-                                {
-                                    var responseMessage = JsonSerializer.Serialize(new
-                                    {
-                                        ctidTraderAccountId = symbolRes.CtidTraderAccountId,
-                                        symbols = symbolRes.Symbol.Select(symbol => new
-                                        {
-                                            symbolId = symbol.SymbolId,
-                                            symbolName = symbol.SymbolName,
-                                            enabled = symbol.Enabled,
-                                            baseAssetId = symbol.BaseAssetId,
-                                            quoteAssetId = symbol.QuoteAssetId,
-                                            symbolCategoryId = symbol.SymbolCategoryId,
-                                            description = symbol.Description
-                                        }).ToList()
-                                    }, new JsonSerializerOptions { WriteIndented = true });
-                                    tcs.TrySetResult(responseMessage);
-                                    successSubscription?.Dispose();
-                                });
-
-                        errorSubscription = client.OfType<ProtoOAErrorRes>()
-                            .Where(err => err.CtidTraderAccountId == ctidTraderAccountId)
-                            .Take(1)
-                            .Subscribe(
-                                errRes =>
-                                {
-                                    var errorMessage = JsonSerializer.Serialize(new
-                                    {
-                                        ctidTraderAccountId = errRes.CtidTraderAccountId,
-                                        errorCode = errRes.ErrorCode.ToString(),
-                                        description = errRes.Description
-                                    }, new JsonSerializerOptions { WriteIndented = true });
-                                    tcs.TrySetResult(errorMessage);
-                                    errorSubscription?.Dispose();
-                                });
-
-                        var symbolReq = new ProtoOASymbolsListReq
-                        {
-                            CtidTraderAccountId = ctidTraderAccountId,
-                        };
-                        await client.SendMessage(symbolReq);
-                    }
+                        CtidTraderAccountId = ctidTraderAccountId,
+                    };
+                    await client.SendMessage(symbolReq);
 
                     var timeoutTask = Task.Delay(TimeSpan.FromSeconds(10));
                     var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
@@ -893,6 +1183,7 @@ namespace ConsoleDemo
                     response.StatusCode = 200;
                     await WriteResponse(response, tcs.Task.Result);
                 }
+
                 else
                 {
                     response.StatusCode = 404;
