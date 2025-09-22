@@ -31,7 +31,7 @@ namespace ConsoleDemo
             _app = new App(AppId, AppSecret, string.Empty);
 
             // Start 10 cTrader connections as fire-and-forget async tasks (each running on thread pool threads)
-            for (int i = 0; i < 10; i++)
+            for (int i = 0; i < 300; i++)
             {
                 _ = StartCTraderConnection();
             }
