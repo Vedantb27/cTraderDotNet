@@ -31,7 +31,7 @@ namespace ConsoleDemo
             _app = new App(AppId, AppSecret, string.Empty);
 
             // Start 10 cTrader connections as fire-and-forget async tasks (each running on thread pool threads)
-            for (int i = 0; i < 300; i++)
+            for (int i = 0; i < 10; i++)
             {
                 _ = StartCTraderConnection();
             }
@@ -558,26 +558,26 @@ namespace ConsoleDemo
             }
         }
 
-        private static async Task StartHttpServer()
-        {
-            try
-            {
-                HttpListener listener = new();
-                listener.Prefixes.Add("http://localhost:5000/");
-                listener.Start();
-                Console.WriteLine("HTTP Server listening on http://localhost:5000/");
+       private static async Task StartHttpServer()
+{
+    try
+    {
+        HttpListener listener = new();
+        listener.Prefixes.Add("http://*:5000/");  // Changed to listen on all interfaces
+        listener.Start();
+        Console.WriteLine("HTTP Server listening on http://*:5000/");
 
-                while (true)
-                {
-                    var context = await listener.GetContextAsync();
-                    await HandleRequest(context);
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"HTTP Server Error: {ex.Message}");
-            }
+        while (true)
+        {
+            var context = await listener.GetContextAsync();
+            await HandleRequest(context);
         }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"HTTP Server Error: {ex.Message}");
+    }
+}
 
         private static async Task HandleRequest(HttpListenerContext context)
         {
