@@ -17,7 +17,7 @@ namespace ConsoleDemo
     {
         private static readonly string AppId = "11608_DdHhy1HVw0kwE1WXrUSZ5ip6j8ro377hROhOyk4pLVmiO9aQmG";
         private static readonly string AppSecret = "QUlHf0Cj2qLspmPXoSmzXadcGqOCyI4xGAkyLvgzL7rEpc4fmj";
-        private static readonly Mode ServerMode = Mode.Demo; // Change to Mode.Live if needed
+        private static readonly Mode ServerMode = Mode.Demo; // Change to Mode.Live if need
         private static readonly List<(OpenClient Client, List<IDisposable> Disposables, CancellationTokenSource Cts)> _cTraderConnections = new();
         private static readonly object _lock = new object();
         private static readonly Dictionary<long, OpenClient> _accountToClient = new();
@@ -41,7 +41,7 @@ namespace ConsoleDemo
 
             // Keep the application running (though StartHttpServer() loops infinitely)
             Console.WriteLine("Application running. Press Ctrl+C to exit.");
-            await Task.Delay(Timeout.Infinite); // Non-blocking wait
+            await Task.Delay(Timeout.Infinite); // Non-blocking wait 
         }
 
         private static async Task StartCTraderConnection()
