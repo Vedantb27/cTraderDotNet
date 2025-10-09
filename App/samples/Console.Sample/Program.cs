@@ -563,9 +563,9 @@ namespace ConsoleDemo
     try
     {
         HttpListener listener = new();
-        listener.Prefixes.Add("http://*:5000/");  // Changed to listen on all interfaces
-        listener.Start();
-        Console.WriteLine("HTTP Server listening on http://*:5000/");
+listener.Prefixes.Add("http://localhost:5000/");  // Listen only on localhost
+listener.Start();
+Console.WriteLine("HTTP Server listening on http://localhost:5000/");
 
         while (true)
         {
